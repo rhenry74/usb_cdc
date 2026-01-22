@@ -8,6 +8,7 @@
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "esp_cpu.h"
 #include <cstring>    // C++ header for strlen
 #include <stdint.h>
 #include <stdio.h>
@@ -96,7 +97,7 @@ static void init_pwm_48khz(void) {
     ledc_channel_config(&ledc_channel);
 }
 
-static volatile uint32_t counter = 0;
+static volatile uint32_t base_cycle = 0;
 static volatile uint32_t channel_buffers[2][NUM_CHANNELS][BUFFER_LEN];
 static volatile uint32_t buffer_index = 0;
 static volatile uint8_t active_buffer = 0; // 0 or 1
@@ -111,7 +112,6 @@ static volatile uint32_t button_press_count = 0;
 static TaskHandle_t buttonTaskHandle = nullptr;
 
 // Forward declarations
-static void counter_task(void* pv);
 static void gpio_setup_task(void* pv);
 static void buffer_monitor_task(void* pv);
 static void button_task(void* pv);
@@ -132,16 +132,6 @@ static void usb_jtag_init_task(void* pv) {
     vTaskDelete(nullptr);
 }
 
-// Fast counter task (core 0)
-static void counter_task(void *pv) {
-    (void) pv;
-    while (true) {
-        counter++;
-        //allow other tasks on this core to run
-        taskYIELD();
-    }
-}
-
 // ISR for GPIO interrupts
 static void IRAM_ATTR gpio_isr_handler(void* arg) {
     if (paused) {
@@ -149,7 +139,8 @@ static void IRAM_ATTR gpio_isr_handler(void* arg) {
     }
     int channel = (int)(uintptr_t)arg;
     uint32_t idx = buffer_index % BUFFER_LEN;
-    channel_buffers[active_buffer][channel][idx] = counter;
+    uint32_t now = esp_cpu_get_cycle_count();
+    channel_buffers[active_buffer][channel][idx] = (uint32_t)(now - base_cycle);
 }
 
 // ISR for incrementing buffer_index
@@ -163,7 +154,7 @@ static void IRAM_ATTR index_isr_handler(void* arg) {
         // Swap buffers when a full set is collected
         active_buffer ^= 1;
     }
-    counter = 0; // Reset counter on index increment
+    base_cycle = esp_cpu_get_cycle_count();
 }
 
 // ISR for button press: notify the button handling task (keep ISR short)
@@ -414,12 +405,6 @@ extern "C" void app_main(void) {
     debug_print(buf);
 
     BaseType_t r_counter = -1;
-    debug_print("Creating counter_task...");
-    r_counter = xTaskCreatePinnedToCore(counter_task, "counter_task", 2048, nullptr, 10, &h_counter, 1);
-    debug_print("counter_task create attempted");
-    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
-    snprintf(buf, sizeof(buf), "Free heap after counter_task: %u bytes", (unsigned)free_heap);
-    debug_print(buf);
 
     snprintf(buf, sizeof(buf),
              "Task create results: ctr=%d btn=%d gpio=%d buf=%d",

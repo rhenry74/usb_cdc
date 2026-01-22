@@ -28,31 +28,31 @@ This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput te
 ---
 
 ## 2) High‑Speed GPIO Sampling (Globals)
-- **`counter`**: Fast‑incrementing time base used to timestamp edges.
+- **`base_cycle`**: Cycle‑counter baseline captured on each index pulse.
 - **`channel_buffers[2][NUM_CHANNELS][BUFFER_LEN]`**: Double‑buffered timestamp storage.
 - **`buffer_index`**: Current sample index (0…`BUFFER_LEN-1`).
 - **`active_buffer`**: Which buffer is currently being filled.
 - **`paused`**: Temporarily disables sampling during test bursts.
 
 ### Buffering Model
-Each channel interrupt stores a timestamp into the active buffer at `buffer_index`. The **index pin** increments `buffer_index`; when it wraps to 0, the inactive buffer is considered “complete” and sent over USB.
+Each channel interrupt stores a timestamp into the active buffer at `buffer_index`. The timestamp is derived from `esp_cpu_get_cycle_count()` minus `base_cycle`, giving a **relative cycle count** since the last index pulse. The **index pin** increments `buffer_index`; when it wraps to 0, the inactive buffer is considered “complete” and sent over USB.
 
 ---
 
 ## 3) GPIO ISRs
 - **`gpio_isr_handler`** (channel pins):
-  - On any edge, stores the current `counter` value in the channel’s buffer slot.
+  - On any edge, stores a **cycle‑count timestamp** (`esp_cpu_get_cycle_count() - base_cycle`) in the channel’s buffer slot.
 - **`index_isr_handler`** (index pin):
   - Advances `buffer_index` and flips the active buffer on wrap.
-  - Resets `counter` on each index edge to measure relative edge timing.
+  - Updates `base_cycle` on each index edge to measure relative edge timing.
 - **`button_isr_handler`** (button pin):
   - Increments a diagnostic counter and notifies the button task.
 
 ---
 
 ## 4) FreeRTOS Tasks
-### `counter_task` (core 0)
-- Tight loop incrementing `counter` (high‑resolution time base).
+### (No counter task)
+- Timing is now derived from the **CPU cycle counter** directly in the GPIO ISR, so the tight `counter_task` is no longer needed.
 
 ### `gpio_setup_task` (core 1)
 - Configures GPIO input modes and attaches ISRs.
