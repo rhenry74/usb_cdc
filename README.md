@@ -1,3 +1,78 @@
+<img width="800" height="600" alt="image" src="https://github.com/user-attachments/assets/99fad94b-808d-4054-b466-ca2f1cd697b9" />
+
+
+The diagram illustrates **how a ramp‑based analog‑to‑digital conversion (ADC) method works** by converting signal amplitude into a **time measurement**.
+
+Here’s what it is showing:
+
+***
+
+## 🔍 **Overall Concept**
+
+A **ramp reference signal** (blue line) increases linearly over time.  
+A sampled analog signal value is represented by a **horizontal threshold level**.
+
+As the ramp rises, the ADC waits until the ramp intersects the sampled signal value.  
+The **time it takes to reach that intersection** becomes the *digital representation* of the sample.
+
+This is why this technique is sometimes called:
+
+*   **Time‑to‑Digital Conversion (TDC)**
+*   **Single‑Slope (Ramp) ADC**
+
+***
+
+## 📈 **What happens in the diagram**
+
+### 1. **A ramp signal resets to zero and starts rising**
+
+Each “sample window” begins with a reset (the left gray vertical line), then the ramp climbs at a constant rate.
+
+### 2. **Different signal amplitudes intersect the ramp at different times**
+
+Green dots labeled **S1**, **S2**, **S3** represent sampled analog voltages.
+
+Because the ramp increases linearly:
+
+*   A **lower amplitude** intersects **sooner**
+*   A **higher amplitude** intersects **later**
+
+Thus, time ↔ amplitude relationship is linear.
+
+### 3. **The ADC measures the time to intersection**
+
+Next to the diagram, the values:
+
+*   S1 = 334
+*   S2 = 662
+*   S3 = 509
+
+represent the *time count* (or digital output) when each sample intersected the ramp.
+
+### 4. **One full ramp period = one sample**
+
+The horizontal arrow labeled **“1 Sample”** shows that each ramp cycle provides one full ADC measurement.
+
+***
+
+## 🧠 **In simpler words**
+
+The diagram shows an ADC that:
+
+1.  Generates a rising reference signal (a ramp)
+2.  Compares the ramp to a sampled analog voltage
+3.  Converts that voltage into a **digital value** by measuring **how long** until the ramp reaches it
+
+**Voltage → Time → Digital Count**
+
+***
+
+## **Hardware**
+- Circuitry external of the ESP32 includes a ramp generator and a compator for each channel
+- Comparator output is tied to an edge capture channel pin on the MCU
+
+***
+
 # usb_cdc – Program Overview
 
 This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput testing**, **high‑speed GPIO edge sampling**, and a **48 kHz PWM output**. It uses FreeRTOS tasks and GPIO interrupts to capture timing data and send buffered samples over USB Serial JTAG, while also providing a button‑triggered test burst and UART debug logs.
