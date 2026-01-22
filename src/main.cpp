@@ -5,13 +5,21 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include <cstring>    // C++ header for strlen
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 static const char *TAG = "DUAL_USB";
+
+// Forward declarations
+static void debug_print(const char* msg);
+static void usb_jtag_init_task(void* pv);
+
+static volatile bool usb_jtag_ready = false;
 
 // Configure UART0 (bridge port) for debug logs
 void init_uart() {
@@ -30,9 +38,13 @@ void init_uart() {
 
 void init_usb_serial_jtag(void) {
     usb_serial_jtag_driver_config_t cfg = USB_SERIAL_JTAG_DRIVER_CONFIG_DEFAULT();
+    cfg.tx_buffer_size = 8192;
+    cfg.rx_buffer_size = 4096;
     esp_err_t err = usb_serial_jtag_driver_install(&cfg);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "usb_serial_jtag_driver_install failed: %s", esp_err_to_name(err));
+        char buf[128];
+        snprintf(buf, sizeof(buf), "usb_serial_jtag_driver_install failed: %s", esp_err_to_name(err));
+        debug_print(buf);
     }
 }
 
@@ -108,8 +120,16 @@ static void debug_print(const char* msg) {
     if (!msg) {
         return;
     }
+
     log_uart(msg);
     log_uart("\r\n");
+}
+
+static void usb_jtag_init_task(void* pv) {
+    (void)pv;
+    init_usb_serial_jtag();
+    usb_jtag_ready = true;
+    vTaskDelete(nullptr);
 }
 
 // Fast counter task (core 0)
@@ -117,7 +137,8 @@ static void counter_task(void *pv) {
     (void) pv;
     while (true) {
         counter++;
-        // No delay: tight loop for high resolution
+        //allow other tasks on this core to run
+        taskYIELD();
     }
 }
 
@@ -157,20 +178,43 @@ static void IRAM_ATTR button_isr_handler(void* arg) {
 static void send_test_burst(void) {
     debug_print("Starting test burst (~64KiB) over USB Serial JTAG");
 
-    const int CHUNK = 4096;
+    const char *start_marker = "BURST_START\r\n";
+    usb_serial_jtag_write_bytes(start_marker, strlen(start_marker), 20 / portTICK_PERIOD_MS);
+    //vTaskDelay(pdMS_TO_TICKS(5));
+
+    const int CHUNK = 512;
     static uint8_t burst[CHUNK];
     for (int i = 0; i < CHUNK; i++) {
-        burst[i] = (uint8_t)(i & 0xFF);
+        burst[i] = (uint8_t)i;
     }
     debug_print("burst array filled");
 
-    const int CHUNKS = 16; // ~64KiB total
+    const int CHUNKS = 128; // ~64KiB total
+    int staged_amount = 0;
     for (int k = 0; k < CHUNKS; k++) {
-        usb_serial_jtag_write_bytes(burst, CHUNK, 20 / portTICK_PERIOD_MS);
-        vTaskDelay(pdMS_TO_TICKS(1));
+        int sent = 0;
+        while (sent < CHUNK) {
+            int wrote = usb_serial_jtag_write_bytes(burst + sent, CHUNK - sent, 20 / portTICK_PERIOD_MS);
+            if (wrote > 0) {
+                sent += wrote;
+                staged_amount += wrote;
+            } else {
+                debug_print("wrote = 0, delaying before retry");
+                vTaskDelay(pdMS_TO_TICKS(1));
+            }
+        }
     }
 
-    debug_print("send_test_burst: all chunks sent");
+    const char *end_marker = "\r\nBURST_END\r\n";
+    usb_serial_jtag_write_bytes(end_marker, strlen(end_marker), 20 / portTICK_PERIOD_MS);
+    //vTaskDelay(pdMS_TO_TICKS(5));
+
+    debug_print("Test burst complete, total bytes sent:");
+    {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%d bytes sent in burst", staged_amount + (int)strlen(start_marker) + (int)strlen(end_marker));
+        debug_print(buf);
+    }
 }
 
 // Task that handles button press: pause sampling, send messages & test burst, resume
@@ -183,7 +227,7 @@ static void button_task(void* pv) {
         // Immediately report notification and ISR counter (safe in task context)
         {
             char buf[96];
-            snprintf(buf, sizeof(buf), "button_task: notified (ISR count=%u)", (unsigned)button_press_count);
+            snprintf(buf, sizeof(buf), "button_task: notified (button press count=%u)", (unsigned)button_press_count);
             debug_print(buf);
         }
         // Debounce grace period
@@ -268,7 +312,7 @@ static void gpio_setup_task(void *pv) {
         if (level != prev_level) {
             prev_level = level;
             char buf[96];
-            snprintf(buf, sizeof(buf), "Button level changed: %d (ISR count=%u)", level, (unsigned)button_press_count);
+            snprintf(buf, sizeof(buf), "Button level changed: %d (button press count=%u)", level, (unsigned)button_press_count);
             debug_print(buf);
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -324,21 +368,64 @@ static void buffer_monitor_task(void *pv) {
 
 extern "C" void app_main(void) {
     init_uart();
-    init_usb_serial_jtag();
     init_pwm_48khz();
 
-    log_uart("Dual USB Echo + Throughput Example Started\r\n");
+    xTaskCreatePinnedToCore(usb_jtag_init_task, "usb_jtag_init", 2048, nullptr, 10, nullptr, 1);
+    while (!usb_jtag_ready) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    debug_print("Dual USB Echo + Throughput Example Started");
+
+    // Disable task watchdog entirely for this project
+    esp_task_wdt_deinit();
+
+    const char *msg = "USB Serial JTAG ready\r\n";
+    usb_serial_jtag_write_bytes(msg, strlen(msg), 2000 / portTICK_PERIOD_MS);
+
+    debug_print("Creating tasks...");
 
     TaskHandle_t h_counter = nullptr;
     TaskHandle_t h_gpio = nullptr;
     TaskHandle_t h_bufmon = nullptr;
-
-    xTaskCreatePinnedToCore(counter_task, "counter_task", 2048, nullptr, 10, &h_counter, 0);
-    xTaskCreatePinnedToCore(button_task, "button_task", 2048, nullptr, 10, &buttonTaskHandle, 1);
-    xTaskCreatePinnedToCore(gpio_setup_task, "gpio_setup_task", 4096, nullptr, 10, &h_gpio, 1);
-    xTaskCreatePinnedToCore(buffer_monitor_task, "buffer_monitor_task", 4096, nullptr, 10, &h_bufmon, 1);
-
+    
     char buf[256];
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    snprintf(buf, sizeof(buf), "Free heap before tasks: %u bytes", (unsigned)free_heap);
+    debug_print(buf);
+
+    BaseType_t r_button = xTaskCreatePinnedToCore(button_task, "button_task", 2048, nullptr, 10, &buttonTaskHandle, 1);
+    debug_print("button_task create attempted");
+    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    snprintf(buf, sizeof(buf), "Free heap after button_task: %u bytes", (unsigned)free_heap);
+    debug_print(buf);
+
+    BaseType_t r_gpio = xTaskCreatePinnedToCore(gpio_setup_task, "gpio_setup_task", 4096, nullptr, 10, &h_gpio, 1);
+    debug_print("gpio_setup_task create attempted");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    snprintf(buf, sizeof(buf), "Free heap after gpio_setup_task: %u bytes", (unsigned)free_heap);
+    debug_print(buf);
+
+    BaseType_t r_bufmon = xTaskCreatePinnedToCore(buffer_monitor_task, "buffer_monitor_task", 4096, nullptr, 10, &h_bufmon, 1);
+    debug_print("buffer_monitor_task create attempted");
+    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    snprintf(buf, sizeof(buf), "Free heap after buffer_monitor_task: %u bytes", (unsigned)free_heap);
+    debug_print(buf);
+
+    BaseType_t r_counter = -1;
+    debug_print("Creating counter_task...");
+    r_counter = xTaskCreatePinnedToCore(counter_task, "counter_task", 2048, nullptr, 10, &h_counter, 1);
+    debug_print("counter_task create attempted");
+    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    snprintf(buf, sizeof(buf), "Free heap after counter_task: %u bytes", (unsigned)free_heap);
+    debug_print(buf);
+
+    snprintf(buf, sizeof(buf),
+             "Task create results: ctr=%d btn=%d gpio=%d buf=%d",
+             (int)r_counter, (int)r_button, (int)r_gpio, (int)r_bufmon);
+    debug_print(buf);
+
     snprintf(buf, sizeof(buf),
              "Tasks created: ctr=%p btn=%p gpio=%p buf=%p",
              (void*)h_counter, (void*)buttonTaskHandle, (void*)h_gpio, (void*)h_bufmon);
@@ -346,6 +433,7 @@ extern "C" void app_main(void) {
 
     while (true) {
         uint8_t data[64];
+        debug_print("Waiting for data over USB Serial JTAG...");
         int len = usb_serial_jtag_read_bytes(data, sizeof(data), 20 / portTICK_PERIOD_MS);
         if (len > 0) {
             log_uart("len > 0\r\n");
