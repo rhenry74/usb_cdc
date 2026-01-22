@@ -4,6 +4,19 @@ This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput te
 
 ---
 
+## Hardware/Pin Map
+**Inputs:**
+- **GPIO2, GPIO4, GPIO5, GPIO13**: High‑speed edge capture channels (interrupt on any edge).
+- **GPIO17**: Index input (advances sample index, resets counter, flips buffers).
+- **GPIO0**: Button input (active‑low; triggers test burst).
+
+**Outputs:**
+- **GPIO18**: 48 kHz PWM output (LEDC low‑speed mode, 50% duty).
+
+> Note: GPIO12 is avoided because it can be a strapping pin on some ESP32‑S3 devkits.
+
+---
+
 ## 1) Initialization (in `app_main()`)
 1. **UART debug init** (`init_uart()`)
    - Sets up UART0 at 115200 baud for debug output.
@@ -15,42 +28,38 @@ This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput te
 ---
 
 ## 2) High‑Speed GPIO Sampling (Globals)
-- **`counter`**: Fast‑incrementing time base.
-- **`channel_buffers[2][NUM_CHANNELS][BUFFER_LEN]`**: Double buffer storing timestamps.
-- **`buffer_index`**: Current sample index.
-- **`active_buffer`**: Which buffer is being filled.
-- **`paused`**: Stops sampling during test bursts.
+- **`counter`**: Fast‑incrementing time base used to timestamp edges.
+- **`channel_buffers[2][NUM_CHANNELS][BUFFER_LEN]`**: Double‑buffered timestamp storage.
+- **`buffer_index`**: Current sample index (0…`BUFFER_LEN-1`).
+- **`active_buffer`**: Which buffer is currently being filled.
+- **`paused`**: Temporarily disables sampling during test bursts.
 
-**Pins used**:
-- **Channel inputs**: GPIO2, GPIO4, GPIO5, GPIO13
-- **Index input**: GPIO17
-- **Button input**: GPIO0
-- **PWM output**: GPIO18
+### Buffering Model
+Each channel interrupt stores a timestamp into the active buffer at `buffer_index`. The **index pin** increments `buffer_index`; when it wraps to 0, the inactive buffer is considered “complete” and sent over USB.
 
 ---
 
 ## 3) GPIO ISRs
 - **`gpio_isr_handler`** (channel pins):
-  - On any edge, store `counter` in the channel buffer.
+  - On any edge, stores the current `counter` value in the channel’s buffer slot.
 - **`index_isr_handler`** (index pin):
-  - Increments `buffer_index`.
-  - Swaps buffers when wrapping to 0.
-  - Resets `counter` each index edge.
+  - Advances `buffer_index` and flips the active buffer on wrap.
+  - Resets `counter` on each index edge to measure relative edge timing.
 - **`button_isr_handler`** (button pin):
-  - Notifies the button task to run the test burst.
+  - Increments a diagnostic counter and notifies the button task.
 
 ---
 
 ## 4) FreeRTOS Tasks
 ### `counter_task` (core 0)
-- Tight loop incrementing `counter` (high‑resolution timing base).
+- Tight loop incrementing `counter` (high‑resolution time base).
 
 ### `gpio_setup_task` (core 1)
-- Configures GPIOs and attaches ISRs.
-- Polls button level changes and logs them.
+- Configures GPIO input modes and attaches ISRs.
+- Periodically polls the button level and logs changes.
 
 ### `buffer_monitor_task` (core 1)
-- Detects buffer wrap and sends the completed buffer via USB Serial JTAG.
+- Detects buffer wrap events and pushes the completed buffer over USB Serial JTAG.
 
 ### `button_task` (core 1)
 - On button press:
@@ -77,6 +86,17 @@ A constant PWM is produced on **GPIO18**:
 - **Frequency**: 48 kHz
 - **Duty**: 50%
 - **LEDC low‑speed mode**
+- **Resolution**: 10‑bit (trade‑off between frequency and resolution)
+
+---
+
+## Data Format Sent Over USB
+When a buffer completes, a single packed payload is sent:
+- **Sync bytes**: `0x55 0xAA`
+- Followed by **NUM_CHANNELS × BUFFER_LEN** samples
+- Each sample is a **24‑bit timestamp** (3 bytes, little‑endian)
+
+Payload length = `2 + NUM_CHANNELS * BUFFER_LEN * 3` bytes.
 
 ---
 
