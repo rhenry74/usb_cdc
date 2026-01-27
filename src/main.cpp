@@ -76,6 +76,7 @@ static inline void log_uart(const char *msg) {
 #define PWM_LEDC_SPEED_MODE LEDC_LOW_SPEED_MODE
 #define PWM_FREQ_HZ 48000
 #define PWM_DUTY_RES LEDC_TIMER_10_BIT
+#define PWM_DUTY_PERCENT 3  // adjust duty cycle here (0-100)
 
 static void init_pwm_48khz(void) {
     ledc_timer_config_t ledc_timer = {};
@@ -86,13 +87,16 @@ static void init_pwm_48khz(void) {
     ledc_timer.clk_cfg = LEDC_AUTO_CLK;
     ledc_timer_config(&ledc_timer);
 
+    const uint32_t max_duty = (1U << PWM_DUTY_RES) - 1;
+    const uint32_t duty = (max_duty * PWM_DUTY_PERCENT) / 100U;
+
     ledc_channel_config_t ledc_channel = {};
     ledc_channel.speed_mode = PWM_LEDC_SPEED_MODE;
     ledc_channel.channel = PWM_LEDC_CHANNEL;
     ledc_channel.timer_sel = PWM_LEDC_TIMER;
     ledc_channel.intr_type = LEDC_INTR_DISABLE;
     ledc_channel.gpio_num = PWM_PIN;
-    ledc_channel.duty = (1 << PWM_DUTY_RES) / 2; // 50% duty
+    ledc_channel.duty = duty;
     ledc_channel.hpoint = 0;
     ledc_channel_config(&ledc_channel);
 }
@@ -257,10 +261,17 @@ static void gpio_setup_task(void *pv) {
     io_conf.mode = GPIO_MODE_INPUT;
     io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
 
-    // install ISR service once
-    gpio_install_isr_service(0);
+    // install ISR service once at level 5
+    auto isr_res = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM);
+    if (isr_res != ESP_OK) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "gpio_install_isr_service failed: %s", esp_err_to_name(isr_res));
+        debug_print(buf);
+    } else {
+        debug_print("GPIO ISR service installed");
+    }   
 
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         io_conf.pin_bit_mask = (1ULL << channel_pins[i]);
@@ -294,7 +305,7 @@ static void gpio_setup_task(void *pv) {
         debug_print(buf);
     }
     // restore intr type for other pins (if we need it later)
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE;
 
     // Loop: poll the button level periodically to detect changes and show ISR counter
     int prev_level = 1; // pulled-up by default
@@ -347,9 +358,9 @@ static void buffer_monitor_task(void *pv) {
         uint8_t send_buffer = active_buffer ^ 1;
         // Detect wrap (index went from BUFFER_LEN-1 -> 0)
         if (idx == 0 && last_index == BUFFER_LEN - 1) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "Buffer wrap detected - sending buffer %d", send_buffer);
-            debug_print(buf);
+            //char buf[64];
+            //snprintf(buf, sizeof(buf), "Buffer wrap detected - sending buffer %d", send_buffer);
+            //debug_print(buf);
             send_buffers_over_usb(send_buffer);
         }
         last_index = idx;
@@ -452,7 +463,7 @@ extern "C" void app_main(void) {
         else
         {
             log_uart("len == 0\r\n");
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            vTaskDelay(pdMS_TO_TICKS(3000));
         }
     }
 }
