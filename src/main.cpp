@@ -5,10 +5,13 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/mcpwm_cap.h"
+#include "driver/mcpwm_sync.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_cpu.h"
+#include <math.h>
 #include <cstring>    // C++ header for strlen
 #include <stdint.h>
 #include <stdio.h>
@@ -101,7 +104,6 @@ static void init_pwm_48khz(void) {
     ledc_channel_config(&ledc_channel);
 }
 
-static volatile uint32_t base_cycle = 0;
 static volatile uint32_t channel_buffers[2][NUM_CHANNELS][BUFFER_LEN];
 static volatile uint32_t buffer_index = 0;
 static volatile uint8_t active_buffer = 0; // 0 or 1
@@ -115,10 +117,19 @@ static volatile uint32_t button_press_count = 0;
 // Task handle for button handler (signalled from ISR)
 static TaskHandle_t buttonTaskHandle = nullptr;
 
+static mcpwm_cap_timer_handle_t cap_timer = nullptr;
+static mcpwm_cap_timer_handle_t cap_timer_aux = nullptr;
+static mcpwm_cap_channel_handle_t cap_ch[NUM_CHANNELS] = {};
+static mcpwm_sync_handle_t cap_sync = nullptr;
+static mcpwm_sync_handle_t cap_sync_aux = nullptr;
+static uint32_t cap_resolution_hz = 0;
+static uint32_t cap_resolution_aux_hz = 0;
+
 // Forward declarations
 static void gpio_setup_task(void* pv);
 static void buffer_monitor_task(void* pv);
 static void button_task(void* pv);
+static void init_mcpwm_capture(void);
 
 static void debug_print(const char* msg) {
     if (!msg) {
@@ -136,18 +147,21 @@ static void usb_jtag_init_task(void* pv) {
     vTaskDelete(nullptr);
 }
 
-// ISR for GPIO interrupts
-static void IRAM_ATTR gpio_isr_handler(void* arg) {
+static bool IRAM_ATTR cap_cb(mcpwm_cap_channel_handle_t chan,
+                             const mcpwm_capture_event_data_t *edata,
+                             void *user_ctx) {
+    (void)chan;
     if (paused) {
-        return; // ignore samples while paused
+        return false;
     }
-    int channel = (int)(uintptr_t)arg;
+
+    int channel = (int)(intptr_t)user_ctx;
     uint32_t idx = buffer_index % BUFFER_LEN;
-    uint32_t now = esp_cpu_get_cycle_count();
-    channel_buffers[active_buffer][channel][idx] = (uint32_t)(now - base_cycle);
+    channel_buffers[active_buffer][channel][idx] = edata->cap_value;
+    return false;
 }
 
-// ISR for incrementing buffer_index
+// ISR for incrementing buffer_index (timing comes from MCPWM capture)
 static void IRAM_ATTR index_isr_handler(void* arg) {
     (void)arg;
     if (paused) {
@@ -158,7 +172,6 @@ static void IRAM_ATTR index_isr_handler(void* arg) {
         // Swap buffers when a full set is collected
         active_buffer ^= 1;
     }
-    base_cycle = esp_cpu_get_cycle_count();
 }
 
 // ISR for button press: notify the button handling task (keep ISR short)
@@ -171,25 +184,49 @@ static void IRAM_ATTR button_isr_handler(void* arg) {
 }
 
 static void send_test_burst(void) {
-    debug_print("Starting test burst (~64KiB) over USB Serial JTAG");
+    debug_print("Starting 1kHz sine burst (5s @ 48kHz, 24-bit) over USB Serial JTAG");
 
-    const char *start_marker = "BURST_START\r\n";
-    usb_serial_jtag_write_bytes(start_marker, strlen(start_marker), 20 / portTICK_PERIOD_MS);
-    //vTaskDelay(pdMS_TO_TICKS(5));
+    constexpr uint32_t sample_rate = 48000;
+    constexpr uint32_t tone_hz = 1000;
+    constexpr uint32_t samples_per_cycle = sample_rate / tone_hz; // 48
+    constexpr uint32_t samples_per_packet = BUFFER_LEN; // 8 samples per channel
+    constexpr uint32_t channels = NUM_CHANNELS;
+    constexpr uint32_t total_samples = sample_rate * 5; // 5 seconds
+    constexpr uint32_t packets = total_samples / samples_per_packet; // 30000 packets
 
-    const int CHUNK = 512;
-    static uint8_t burst[CHUNK];
-    for (int i = 0; i < CHUNK; i++) {
-        burst[i] = (uint8_t)i;
+    static uint32_t sine_table[samples_per_cycle];
+    for (uint32_t i = 0; i < samples_per_cycle; ++i) {
+        float phase = 2.0f * 3.14159265f * (static_cast<float>(i) / samples_per_cycle);
+        float s = sinf(phase);
+        float scaled = 0.5f + 0.499999f * s; // keep within [0,1) to avoid clipping
+        uint32_t sample = static_cast<uint32_t>(scaled * 16777215.0f); // 24-bit unsigned
+        sine_table[i] = sample & 0xFFFFFF;
     }
-    debug_print("burst array filled");
 
-    const int CHUNKS = 128; // ~64KiB total
+    uint8_t tx_buf[2 + channels * samples_per_packet * 3];
     int staged_amount = 0;
-    for (int k = 0; k < CHUNKS; k++) {
+    uint32_t sample_index = 0;
+
+    for (uint32_t pkt = 0; pkt < packets; ++pkt) {
+        tx_buf[0] = 0x55;
+        tx_buf[1] = 0xAA;
+
+        size_t off = 2;
+        for (uint32_t ch = 0; ch < channels; ++ch) {
+            for (uint32_t i = 0; i < samples_per_packet; ++i) {
+                uint32_t sample = sine_table[(sample_index + i) % samples_per_cycle];
+                tx_buf[off++] = (sample >> 0) & 0xFF;
+                tx_buf[off++] = (sample >> 8) & 0xFF;
+                tx_buf[off++] = (sample >> 16) & 0xFF;
+            }
+        }
+
+        sample_index += samples_per_packet;
+
         int sent = 0;
-        while (sent < CHUNK) {
-            int wrote = usb_serial_jtag_write_bytes(burst + sent, CHUNK - sent, 20 / portTICK_PERIOD_MS);
+        const int payload_len = sizeof(tx_buf);
+        while (sent < payload_len) {
+            int wrote = usb_serial_jtag_write_bytes(tx_buf + sent, payload_len - sent, 20 / portTICK_PERIOD_MS);
             if (wrote > 0) {
                 sent += wrote;
                 staged_amount += wrote;
@@ -200,17 +237,19 @@ static void send_test_burst(void) {
         }
     }
 
-    const char *end_marker = "\r\nBURST_END\r\n";
-    usb_serial_jtag_write_bytes(end_marker, strlen(end_marker), 20 / portTICK_PERIOD_MS);
-    //vTaskDelay(pdMS_TO_TICKS(5));
-
-    debug_print("Test burst complete, total bytes sent:");
+    debug_print("Sine burst complete, total bytes sent:");
     {
         char buf[64];
-        snprintf(buf, sizeof(buf), "%d bytes sent in burst", staged_amount + (int)strlen(start_marker) + (int)strlen(end_marker));
+        snprintf(buf, sizeof(buf), "%d bytes sent in burst", staged_amount);
         debug_print(buf);
     }
 }
+
+// Pins to use for interrupts (change as needed)
+// NOTE: GPIO12 can be a strapping/boot pin on some devkits; use GPIO13 instead on ESP32-S3 DevKitC-1-N16R8
+static const gpio_num_t channel_pins[NUM_CHANNELS] = {
+    GPIO_NUM_2, GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_13
+};
 
 // Task that handles button press: pause sampling, send messages & test burst, resume
 static void button_task(void* pv) {
@@ -245,11 +284,72 @@ static void button_task(void* pv) {
     }
 }
 
-// Pins to use for interrupts (change as needed)
-// NOTE: GPIO12 can be a strapping/boot pin on some devkits; use GPIO13 instead on ESP32-S3 DevKitC-1-N16R8
-static const gpio_num_t channel_pins[NUM_CHANNELS] = {
-    GPIO_NUM_2, GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_13
-};
+static void init_mcpwm_capture(void) {
+    mcpwm_capture_event_callbacks_t cbs = {};
+    cbs.on_cap = cap_cb;
+
+    mcpwm_capture_timer_config_t cap_timer_config = {};
+    cap_timer_config.group_id = 0;
+    cap_timer_config.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+    cap_timer_config.resolution_hz = 0;
+    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_config, &cap_timer));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
+
+    for (int i = 0; i < 3; ++i) {
+        mcpwm_capture_channel_config_t cap_ch_config = {};
+        cap_ch_config.gpio_num = channel_pins[i];
+        cap_ch_config.prescale = 1;
+        cap_ch_config.flags.neg_edge = true;
+        cap_ch_config.flags.pos_edge = false;
+        ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer, &cap_ch_config, &cap_ch[i]));
+        ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_ch[i], &cbs, (void*)(intptr_t)i));
+        ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_ch[i]));
+    }
+
+    mcpwm_gpio_sync_src_config_t sync_src_cfg = {};
+    sync_src_cfg.group_id = 0;
+    sync_src_cfg.gpio_num = INDEX_PIN;
+    sync_src_cfg.flags.active_neg = true;
+    ESP_ERROR_CHECK(mcpwm_new_gpio_sync_src(&sync_src_cfg, &cap_sync));
+
+    mcpwm_capture_timer_sync_phase_config_t sync_phase_cfg = {};
+    sync_phase_cfg.sync_src = cap_sync;
+    sync_phase_cfg.count_value = 0;
+    sync_phase_cfg.direction = MCPWM_TIMER_DIRECTION_UP;
+    ESP_ERROR_CHECK(mcpwm_capture_timer_set_phase_on_sync(cap_timer, &sync_phase_cfg));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_get_resolution(cap_timer, &cap_resolution_hz));
+
+    mcpwm_capture_timer_config_t cap_timer_aux_config = {};
+    cap_timer_aux_config.group_id = 1;
+    cap_timer_aux_config.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
+    cap_timer_aux_config.resolution_hz = cap_resolution_hz;
+    ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_aux_config, &cap_timer_aux));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer_aux));
+
+    mcpwm_capture_channel_config_t cap_ch_config = {};
+    cap_ch_config.gpio_num = channel_pins[3];
+    cap_ch_config.prescale = 1;
+    cap_ch_config.flags.neg_edge = true;
+    cap_ch_config.flags.pos_edge = false;
+    ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer_aux, &cap_ch_config, &cap_ch[3]));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_ch[3], &cbs, (void*)(intptr_t)3));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_ch[3]));
+
+    mcpwm_gpio_sync_src_config_t sync_src_aux_cfg = {};
+    sync_src_aux_cfg.group_id = 1;
+    sync_src_aux_cfg.gpio_num = INDEX_PIN;
+    sync_src_aux_cfg.flags.active_neg = true;
+    ESP_ERROR_CHECK(mcpwm_new_gpio_sync_src(&sync_src_aux_cfg, &cap_sync_aux));
+
+    mcpwm_capture_timer_sync_phase_config_t sync_phase_aux_cfg = {};
+    sync_phase_aux_cfg.sync_src = cap_sync_aux;
+    sync_phase_aux_cfg.count_value = 0;
+    sync_phase_aux_cfg.direction = MCPWM_TIMER_DIRECTION_UP;
+    ESP_ERROR_CHECK(mcpwm_capture_timer_set_phase_on_sync(cap_timer_aux, &sync_phase_aux_cfg));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer_aux));
+    ESP_ERROR_CHECK(mcpwm_capture_timer_get_resolution(cap_timer_aux, &cap_resolution_aux_hz));
+}
 
 // Task to configure GPIO interrupts (core 1)
 static void gpio_setup_task(void *pv) {
@@ -276,15 +376,14 @@ static void gpio_setup_task(void *pv) {
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         io_conf.pin_bit_mask = (1ULL << channel_pins[i]);
         gpio_config(&io_conf);
-        gpio_isr_handler_add(channel_pins[i], gpio_isr_handler, (void*)(uintptr_t)i);
         {
             char buf[64];
-            snprintf(buf, sizeof(buf), "ISR attached: channel %d -> pin %d", i, (int)channel_pins[i]);
+            snprintf(buf, sizeof(buf), "MCPWM capture configured: channel %d -> pin %d", i, (int)channel_pins[i]);
             debug_print(buf);
         }
     }
 
-    // Configure the index increment pin
+    // Configure the index increment pin (only for buffer indexing)
     io_conf.pin_bit_mask = (1ULL << INDEX_PIN);
     gpio_config(&io_conf);
     gpio_isr_handler_add((gpio_num_t)INDEX_PIN, index_isr_handler, nullptr);
@@ -386,6 +485,8 @@ extern "C" void app_main(void) {
     usb_serial_jtag_write_bytes(msg, strlen(msg), 2000 / portTICK_PERIOD_MS);
 
     debug_print("Creating tasks...");
+
+    init_mcpwm_capture();
 
     TaskHandle_t h_counter = nullptr;
     TaskHandle_t h_gpio = nullptr;
