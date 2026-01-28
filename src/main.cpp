@@ -109,7 +109,7 @@ static volatile uint32_t buffer_index = 0;
 static volatile uint8_t active_buffer = 0; // 0 or 1
 
 // Control flag to pause ISR-driven sampling while test burst runs
-static volatile bool paused = false;
+static volatile bool paused = true;
 
 // Debug counter incremented from ISR when button pressed (diagnostic only)
 static volatile uint32_t button_press_count = 0;
@@ -288,10 +288,12 @@ static void init_mcpwm_capture(void) {
     mcpwm_capture_event_callbacks_t cbs = {};
     cbs.on_cap = cap_cb;
 
+    const uint32_t desired_cap_resolution_hz = 160000000;
+
     mcpwm_capture_timer_config_t cap_timer_config = {};
     cap_timer_config.group_id = 0;
     cap_timer_config.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
-    cap_timer_config.resolution_hz = 0;
+    cap_timer_config.resolution_hz = desired_cap_resolution_hz;
     ESP_ERROR_CHECK(mcpwm_new_capture_timer(&cap_timer_config, &cap_timer));
     ESP_ERROR_CHECK(mcpwm_capture_timer_enable(cap_timer));
 
@@ -319,6 +321,12 @@ static void init_mcpwm_capture(void) {
     ESP_ERROR_CHECK(mcpwm_capture_timer_set_phase_on_sync(cap_timer, &sync_phase_cfg));
     ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer));
     ESP_ERROR_CHECK(mcpwm_capture_timer_get_resolution(cap_timer, &cap_resolution_hz));
+
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Capture timer group0 resolution: %u Hz", (unsigned)cap_resolution_hz);
+        debug_print(buf);
+    }
 
     mcpwm_capture_timer_config_t cap_timer_aux_config = {};
     cap_timer_aux_config.group_id = 1;
@@ -349,6 +357,12 @@ static void init_mcpwm_capture(void) {
     ESP_ERROR_CHECK(mcpwm_capture_timer_set_phase_on_sync(cap_timer_aux, &sync_phase_aux_cfg));
     ESP_ERROR_CHECK(mcpwm_capture_timer_start(cap_timer_aux));
     ESP_ERROR_CHECK(mcpwm_capture_timer_get_resolution(cap_timer_aux, &cap_resolution_aux_hz));
+
+    {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "Capture timer group1 resolution: %u Hz", (unsigned)cap_resolution_aux_hz);
+        debug_print(buf);
+    }
 }
 
 // Task to configure GPIO interrupts (core 1)
