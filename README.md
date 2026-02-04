@@ -76,7 +76,7 @@ The diagram shows an ADC that:
 
 # usb_cdc – Program Overview
 
-This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput testing**, **precise MCPWM-based edge sampling**, and a **48 kHz PWM output**. It uses FreeRTOS tasks and hardware capture peripherals to obtain accurate timing data and send buffered samples over USB Serial JTAG, while also providing a button‑triggered test burst and UART debug logs.
+This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput testing**, **precise MCPWM-based edge sampling**, and a **44.1 kHz PWM output**. It uses FreeRTOS tasks and hardware capture peripherals to obtain accurate timing data and send buffered samples over USB Serial JTAG, while also providing a button‑triggered test burst and UART debug logs.
 
 ---
 
@@ -87,7 +87,7 @@ This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput te
 - **GPIO0**: Button input (active‑low; triggers test burst).
 
 **Outputs:**
-- **GPIO18**: 48 kHz PWM output (LEDC low‑speed mode, 50% duty).
+- **GPIO18**: 44.1 kHz PWM output (LEDC low‑speed mode, 50% duty).
 
 > Note: GPIO12 is avoided because it can be a strapping pin on some ESP32‑S3 devkits.
 
@@ -98,8 +98,8 @@ This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput te
    - Sets up UART0 at 115200 baud for debug output.
 2. **USB Serial JTAG init** (`init_usb_serial_jtag()`)
    - Installs the USB Serial JTAG driver for host communication.
-3. **PWM init** (`init_pwm_48khz()`)
-   - Configures LEDC low‑speed timer/channel to output **48 kHz** PWM at **50% duty** on **GPIO18**.
+4. **PWM init** (`init_pwm_44k1()`)
+   - Configures LEDC low‑speed timer/channel to output **44.1 kHz** PWM at **50% duty** on **GPIO18**.
 4. **MCPWM Capture init** (`init_mcpwm_capture()`)
    - Configures two MCPWM capture timers (one per group) to handle 4 channels.
    - Sets up hardware synchronization to reset timers on the **INDEX** pin edge.
@@ -147,26 +147,25 @@ The system uses the ESP32-S3's **MCPWM Capture** peripheral for precise edge tim
 ### `button_task` (core 1)
 - On button press:
   1. Pauses sampling.
-  2. Sends a **1 kHz sine wave burst** (generated mathematically) over USB Serial JTAG for ~5 seconds.
+  2. Sends a **1 kHz sine wave burst** (generated mathematically) over USB Serial JTAG for **5 seconds**.
   3. Resumes sampling.
 
 ---
 
-## 5) USB Serial JTAG Throughput Loop
+## 5) UART Command Loop
 Inside the main loop:
-- Reads up to 64 bytes from USB Serial JTAG.
-- If data arrives:
-  - Echoes it back 100 times.
-  - Measures elapsed time.
-  - Logs throughput to UART.
-- If no data:
-  - Logs idle status and sleeps 1s.
+- Reads bytes from UART0.
+- Buffers a line until `\r` or `\n`.
+- Parses commands:
+  - `TONE <freq_hz> <duration_ms>`
+    - Example: `TONE 1000 5000`
+    - Triggers a burst using the shared tone generator.
 
 ---
 
 ## 6) PWM Output
 A constant PWM is produced on **GPIO18**:
-- **Frequency**: 48 kHz
+- **Frequency**: 44.1 kHz
 - **Duty**: 50%
 - **LEDC low‑speed mode**
 - **Resolution**: 10‑bit (trade‑off between frequency and resolution)
@@ -184,9 +183,9 @@ Payload length = `2 + NUM_CHANNELS * BUFFER_LEN * 3` bytes.
 ---
 
 ## Summary
-✅ Outputs 48 kHz PWM on GPIO18
+✅ Outputs 44.1 kHz PWM on GPIO18
 ✅ Samples 4 comparator inputs using **MCPWM hardware capture**
 ✅ **Hardware sync** on Index pin for jitter-free reference
 ✅ Sends buffers over USB Serial JTAG
 ✅ Button triggers **1 kHz sine wave test burst**
-✅ USB echo loop reports throughput
+✅ UART command loop triggers test tones

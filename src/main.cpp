@@ -72,16 +72,16 @@ static inline void log_uart(const char *msg) {
 #define BUFFER_LEN 8
 #define INDEX_PIN 17 // GPIO17
 #define BUTTON_PIN 0  // BOOT button; change if your board uses a different button/pin
-#define PWM_PIN 18   // GPIO18 (free pin for 48 kHz PWM output)
+#define PWM_PIN 18   // GPIO18 (free pin for 44.1 kHz PWM output)
 
 #define PWM_LEDC_TIMER LEDC_TIMER_0
 #define PWM_LEDC_CHANNEL LEDC_CHANNEL_0
 #define PWM_LEDC_SPEED_MODE LEDC_LOW_SPEED_MODE
-#define PWM_FREQ_HZ 48000
+#define PWM_FREQ_HZ 44100
 #define PWM_DUTY_RES LEDC_TIMER_10_BIT
 #define PWM_DUTY_PERCENT 3  // adjust duty cycle here (0-100)
 
-static void init_pwm_48khz(void) {
+static void init_pwm_44k1(void) {
     ledc_timer_config_t ledc_timer = {};
     ledc_timer.speed_mode = PWM_LEDC_SPEED_MODE;
     ledc_timer.duty_resolution = PWM_DUTY_RES;
@@ -183,29 +183,43 @@ static void IRAM_ATTR button_isr_handler(void* arg) {
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
-static void send_test_burst(void) {
-    debug_print("Starting 1kHz sine burst (5s @ 48kHz, 24-bit) over USB Serial JTAG");
+static constexpr uint32_t kSampleRateHz = 44100;
+static constexpr float kDefaultToneHz = 1000.0f;
+static constexpr int kDefaultBurstMs = 5000;
 
-    constexpr uint32_t sample_rate = 48000;
-    constexpr uint32_t tone_hz = 1000;
-    constexpr uint32_t samples_per_cycle = sample_rate / tone_hz; // 48
+static uint32_t next_sine_sample(float &phase, float phase_inc) {
+    float s = sinf(2.0f * 3.14159265f * phase);
+    float scaled = 0.5f + 0.499999f * s; // keep within [0,1) to avoid clipping
+    uint32_t sample = static_cast<uint32_t>(scaled * 16777215.0f); // 24-bit unsigned
+    phase += phase_inc;
+    if (phase >= 1.0f) {
+        phase -= 1.0f;
+    }
+    return sample & 0xFFFFFF;
+}
+
+static void send_test_burst(float tone_hz, int duration_ms) {
+    if (tone_hz <= 0.0f || duration_ms <= 0) {
+        debug_print("Invalid tone or duration; expected > 0");
+        return;
+    }
+
+    char start_msg[128];
+    snprintf(start_msg, sizeof(start_msg),
+             "Starting %.2f Hz sine burst (%d ms @ %u Hz, 24-bit) over USB Serial JTAG",
+             tone_hz, duration_ms, (unsigned)kSampleRateHz);
+    debug_print(start_msg);
+
     constexpr uint32_t samples_per_packet = BUFFER_LEN; // 8 samples per channel
     constexpr uint32_t channels = NUM_CHANNELS;
-    constexpr uint32_t total_samples = sample_rate * 5; // 5 seconds
-    constexpr uint32_t packets = total_samples / samples_per_packet; // 30000 packets
-
-    static uint32_t sine_table[samples_per_cycle];
-    for (uint32_t i = 0; i < samples_per_cycle; ++i) {
-        float phase = 2.0f * 3.14159265f * (static_cast<float>(i) / samples_per_cycle);
-        float s = sinf(phase);
-        float scaled = 0.5f + 0.499999f * s; // keep within [0,1) to avoid clipping
-        uint32_t sample = static_cast<uint32_t>(scaled * 16777215.0f); // 24-bit unsigned
-        sine_table[i] = sample & 0xFFFFFF;
-    }
+    const uint32_t total_samples = (kSampleRateHz * static_cast<uint32_t>(duration_ms)) / 1000U;
+    const uint32_t packets = (total_samples + samples_per_packet - 1) / samples_per_packet;
+    const float phase_inc = tone_hz / static_cast<float>(kSampleRateHz);
 
     uint8_t tx_buf[2 + channels * samples_per_packet * 3];
     int staged_amount = 0;
     uint32_t sample_index = 0;
+    float phase = 0.0f;
 
     for (uint32_t pkt = 0; pkt < packets; ++pkt) {
         tx_buf[0] = 0x55;
@@ -214,14 +228,16 @@ static void send_test_burst(void) {
         size_t off = 2;
         for (uint32_t ch = 0; ch < channels; ++ch) {
             for (uint32_t i = 0; i < samples_per_packet; ++i) {
-                uint32_t sample = sine_table[(sample_index + i) % samples_per_cycle];
+                uint32_t sample = 0;
+                if (sample_index < total_samples) {
+                    sample = next_sine_sample(phase, phase_inc);
+                    sample_index++;
+                }
                 tx_buf[off++] = (sample >> 0) & 0xFF;
                 tx_buf[off++] = (sample >> 8) & 0xFF;
                 tx_buf[off++] = (sample >> 16) & 0xFF;
             }
         }
-
-        sample_index += samples_per_packet;
 
         int sent = 0;
         const int payload_len = sizeof(tx_buf);
@@ -272,7 +288,7 @@ static void button_task(void* pv) {
         debug_print("Sampling paused - starting test burst");
 
         // Send test data
-        send_test_burst();
+        send_test_burst(kDefaultToneHz, kDefaultBurstMs);
 
         debug_print("Test burst complete - resuming sampling");
 
@@ -481,9 +497,29 @@ static void buffer_monitor_task(void *pv) {
     }
 }
 
+static void handle_uart_command(const char *line) {
+    if (!line || line[0] == '\0') {
+        return;
+    }
+
+    float tone_hz = 0.0f;
+    int duration_ms = 0;
+    if (sscanf(line, "TONE %f %d", &tone_hz, &duration_ms) == 2 ||
+        sscanf(line, "tone %f %d", &tone_hz, &duration_ms) == 2) {
+        paused = true;
+        debug_print("Sampling paused - starting UART test burst");
+        send_test_burst(tone_hz, duration_ms);
+        debug_print("UART test burst complete - resuming sampling");
+        paused = false;
+        return;
+    }
+
+    debug_print("Unknown UART command. Use: TONE <freq_hz> <duration_ms>");
+}
+
 extern "C" void app_main(void) {
     init_uart();
-    init_pwm_48khz();
+    init_pwm_44k1();
 
     xTaskCreatePinnedToCore(usb_jtag_init_task, "usb_jtag_init", 2048, nullptr, 10, nullptr, 1);
     while (!usb_jtag_ready) {
@@ -542,43 +578,27 @@ extern "C" void app_main(void) {
              (void*)h_counter, (void*)buttonTaskHandle, (void*)h_gpio, (void*)h_bufmon);
     debug_print(buf);
 
+    char cmd_buf[128] = {};
+    size_t cmd_len = 0;
+
     while (true) {
         uint8_t data[64];
-        debug_print("Waiting for data over USB Serial JTAG...");
-        int len = usb_serial_jtag_read_bytes(data, sizeof(data), 20 / portTICK_PERIOD_MS);
+        int len = uart_read_bytes(UART_NUM_0, data, sizeof(data), 20 / portTICK_PERIOD_MS);
         if (len > 0) {
-            log_uart("len > 0\r\n");
-            // Timestamp before sending
-            int64_t start_us = esp_timer_get_time();
-
-            // Echo back 100 times
-            for (int i = 0; i < 100; i++) {
-                usb_serial_jtag_write_bytes(data, len, 20 / portTICK_PERIOD_MS);
+            for (int i = 0; i < len; ++i) {
+                char c = static_cast<char>(data[i]);
+                if (c == '\r' || c == '\n') {
+                    if (cmd_len > 0) {
+                        cmd_buf[cmd_len] = '\0';
+                        handle_uart_command(cmd_buf);
+                        cmd_len = 0;
+                    }
+                } else if (cmd_len + 1 < sizeof(cmd_buf)) {
+                    cmd_buf[cmd_len++] = c;
+                }
             }
-
-            // Timestamp after sending
-            int64_t end_us = esp_timer_get_time();
-            int64_t elapsed_us = end_us - start_us;
-
-            // Calculate throughput
-            int total_bytes = len * 100;
-            double kbps = (double)total_bytes / (double)elapsed_us * 1000.0;
-
-            // Format debug line
-            int outlen = snprintf(buf, sizeof(buf),
-                     "START: %lld us, END: %lld us, Elapsed: %lld us, "
-                     "Bytes: %d, Rate: %.2f kB/s\r\n",
-                     start_us, end_us, elapsed_us, total_bytes, kbps);
-
-            // Write to UART bridge safely
-            if (outlen > 0) {
-                uart_write_bytes(UART_NUM_0, buf, outlen);
-            }
-        }
-        else
-        {
-            log_uart("len == 0\r\n");
-            vTaskDelay(pdMS_TO_TICKS(3000));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
 }
