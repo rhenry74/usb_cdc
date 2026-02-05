@@ -146,9 +146,15 @@ The system uses the ESP32-S3's **MCPWM Capture** peripheral for precise edge tim
 
 ### `button_task` (core 1)
 - On button press:
-  1. Pauses sampling.
-  2. Sends a **1 kHz sine wave burst** (generated mathematically) over USB Serial JTAG for **5 seconds**.
-  3. Resumes sampling.
+  1. Queues a **1 kHz sine wave burst** (generated mathematically) for **5 seconds**.
+  2. Burst execution (pause/resume + send) is handled by `burst_task`.
+
+### `burst_task` (core 1)
+- Dedicated burst executor with a larger stack to avoid overflow.
+- Owns **capture pause/resume** while a burst is running.
+- Handles **drop‑then‑queue** behavior:
+  - If a burst is active, one request is queued.
+  - Additional overlapping requests are dropped until the queued burst runs.
 
 ---
 
@@ -159,7 +165,8 @@ Inside the main loop:
 - Parses commands:
   - `TONE <freq_hz> <duration_ms>`
     - Example: `TONE 1000 5000`
-    - Triggers a burst using the shared tone generator.
+    - Requests a burst from `burst_task` (shared tone generator).
+    - Capture pause/resume is handled inside `burst_task`.
 
 ---
 

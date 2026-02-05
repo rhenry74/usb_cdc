@@ -116,6 +116,7 @@ static volatile uint32_t button_press_count = 0;
 
 // Task handle for button handler (signalled from ISR)
 static TaskHandle_t buttonTaskHandle = nullptr;
+static TaskHandle_t burstTaskHandle = nullptr;
 
 static mcpwm_cap_timer_handle_t cap_timer = nullptr;
 static mcpwm_cap_timer_handle_t cap_timer_aux = nullptr;
@@ -129,6 +130,7 @@ static uint32_t cap_resolution_aux_hz = 0;
 static void gpio_setup_task(void* pv);
 static void buffer_monitor_task(void* pv);
 static void button_task(void* pv);
+static void burst_task(void* pv);
 static void init_mcpwm_capture(void);
 
 static void debug_print(const char* msg) {
@@ -187,6 +189,18 @@ static constexpr uint32_t kSampleRateHz = 44100;
 static constexpr float kDefaultToneHz = 1000.0f;
 static constexpr int kDefaultBurstMs = 5000;
 
+static portMUX_TYPE burst_request_mux = portMUX_INITIALIZER_UNLOCKED;
+
+struct BurstRequest {
+    float tone_hz;
+    int duration_ms;
+};
+
+static volatile BurstRequest burst_request = {kDefaultToneHz, kDefaultBurstMs};
+static volatile bool burst_active = false;
+static volatile bool burst_queued = false;
+static volatile BurstRequest burst_queued_request = {kDefaultToneHz, kDefaultBurstMs};
+
 static uint32_t next_sine_sample(float &phase, float phase_inc) {
     float s = sinf(2.0f * 3.14159265f * phase);
     float scaled = 0.5f + 0.499999f * s; // keep within [0,1) to avoid clipping
@@ -204,11 +218,7 @@ static void send_test_burst(float tone_hz, int duration_ms) {
         return;
     }
 
-    char start_msg[128];
-    snprintf(start_msg, sizeof(start_msg),
-             "Starting %.2f Hz sine burst (%d ms @ %u Hz, 24-bit) over USB Serial JTAG",
-             tone_hz, duration_ms, (unsigned)kSampleRateHz);
-    debug_print(start_msg);
+    debug_print("Starting sine burst over USB Serial JTAG");
 
     constexpr uint32_t samples_per_packet = BUFFER_LEN; // 8 samples per channel
     constexpr uint32_t channels = NUM_CHANNELS;
@@ -216,7 +226,7 @@ static void send_test_burst(float tone_hz, int duration_ms) {
     const uint32_t packets = (total_samples + samples_per_packet - 1) / samples_per_packet;
     const float phase_inc = tone_hz / static_cast<float>(kSampleRateHz);
 
-    uint8_t tx_buf[2 + channels * samples_per_packet * 3];
+    static uint8_t tx_buf[2 + channels * samples_per_packet * 3];
     int staged_amount = 0;
     uint32_t sample_index = 0;
     float phase = 0.0f;
@@ -261,6 +271,60 @@ static void send_test_burst(float tone_hz, int duration_ms) {
     }
 }
 
+static void request_burst(float tone_hz, int duration_ms) {
+    if (!burstTaskHandle) {
+        debug_print("burst_task not ready");
+        return;
+    }
+
+    taskENTER_CRITICAL(&burst_request_mux);
+    if (burst_active) {
+        if (!burst_queued) {
+            burst_queued_request.tone_hz = tone_hz;
+            burst_queued_request.duration_ms = duration_ms;
+            burst_queued = true;
+        }
+        taskEXIT_CRITICAL(&burst_request_mux);
+        return;
+    }
+
+    burst_request.tone_hz = tone_hz;
+    burst_request.duration_ms = duration_ms;
+    burst_active = true;
+    taskEXIT_CRITICAL(&burst_request_mux);
+
+    xTaskNotifyGive(burstTaskHandle);
+}
+
+static void burst_task(void* pv) {
+    (void) pv;
+    debug_print("burst_task started");
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        BurstRequest req;
+        taskENTER_CRITICAL(&burst_request_mux);
+        req = burst_request;
+        taskEXIT_CRITICAL(&burst_request_mux);
+
+        paused = true;
+        debug_print("Sampling paused - starting burst");
+        send_test_burst(req.tone_hz, req.duration_ms);
+        debug_print("Burst complete - resuming sampling");
+        paused = false;
+
+        taskENTER_CRITICAL(&burst_request_mux);
+        if (burst_queued) {
+            burst_request = burst_queued_request;
+            burst_queued = false;
+            taskEXIT_CRITICAL(&burst_request_mux);
+            xTaskNotifyGive(burstTaskHandle);
+            continue;
+        }
+        burst_active = false;
+        taskEXIT_CRITICAL(&burst_request_mux);
+    }
+}
+
 // Pins to use for interrupts (change as needed)
 // NOTE: GPIO12 can be a strapping/boot pin on some devkits; use GPIO13 instead on ESP32-S3 DevKitC-1-N16R8
 static const gpio_num_t channel_pins[NUM_CHANNELS] = {
@@ -283,20 +347,12 @@ static void button_task(void* pv) {
         // Debounce grace period
         vTaskDelay(pdMS_TO_TICKS(20));
 
-        // Pause sampling
-        paused = true;
-        debug_print("Sampling paused - starting test burst");
-
-        // Send test data
-        send_test_burst(kDefaultToneHz, kDefaultBurstMs);
-
-        debug_print("Test burst complete - resuming sampling");
+        request_burst(kDefaultToneHz, kDefaultBurstMs);
 
         // Prevent bouncing / repeated triggers
         vTaskDelay(pdMS_TO_TICKS(500));
 
-        // Resume sampling
-        paused = false;
+        // Resume sampling handled by burst_task
     }
 }
 
@@ -453,7 +509,7 @@ static void gpio_setup_task(void *pv) {
 static void send_buffers_over_usb(uint8_t send_buffer) {
     // Pack sync + all channels into a single buffer and send once (better throughput)
     const size_t payload_len = 2 + (size_t)NUM_CHANNELS * BUFFER_LEN * 3;
-    uint8_t tx_buf[2 + NUM_CHANNELS * BUFFER_LEN * 3];
+    static uint8_t tx_buf[2 + NUM_CHANNELS * BUFFER_LEN * 3];
     tx_buf[0] = 0x55;
     tx_buf[1] = 0xAA;
 
@@ -506,11 +562,7 @@ static void handle_uart_command(const char *line) {
     int duration_ms = 0;
     if (sscanf(line, "TONE %f %d", &tone_hz, &duration_ms) == 2 ||
         sscanf(line, "tone %f %d", &tone_hz, &duration_ms) == 2) {
-        paused = true;
-        debug_print("Sampling paused - starting UART test burst");
-        send_test_burst(tone_hz, duration_ms);
-        debug_print("UART test burst complete - resuming sampling");
-        paused = false;
+        request_burst(tone_hz, duration_ms);
         return;
     }
 
@@ -547,6 +599,12 @@ extern "C" void app_main(void) {
     snprintf(buf, sizeof(buf), "Free heap before tasks: %u bytes", (unsigned)free_heap);
     debug_print(buf);
 
+    BaseType_t r_burst = xTaskCreatePinnedToCore(burst_task, "burst_task", 4096, nullptr, 11, &burstTaskHandle, 1);
+    debug_print("burst_task create attempted");
+    free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    snprintf(buf, sizeof(buf), "Free heap after burst_task: %u bytes", (unsigned)free_heap);
+    debug_print(buf);
+
     BaseType_t r_button = xTaskCreatePinnedToCore(button_task, "button_task", 2048, nullptr, 10, &buttonTaskHandle, 1);
     debug_print("button_task create attempted");
     free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
@@ -569,13 +627,14 @@ extern "C" void app_main(void) {
     BaseType_t r_counter = -1;
 
     snprintf(buf, sizeof(buf),
-             "Task create results: ctr=%d btn=%d gpio=%d buf=%d",
-             (int)r_counter, (int)r_button, (int)r_gpio, (int)r_bufmon);
+             "Task create results: ctr=%d burst=%d btn=%d gpio=%d buf=%d",
+             (int)r_counter, (int)r_burst, (int)r_button, (int)r_gpio, (int)r_bufmon);
     debug_print(buf);
 
     snprintf(buf, sizeof(buf),
-             "Tasks created: ctr=%p btn=%p gpio=%p buf=%p",
-             (void*)h_counter, (void*)buttonTaskHandle, (void*)h_gpio, (void*)h_bufmon);
+             "Tasks created: ctr=%p burst=%p btn=%p gpio=%p buf=%p",
+             (void*)h_counter, (void*)burstTaskHandle, (void*)buttonTaskHandle,
+             (void*)h_gpio, (void*)h_bufmon);
     debug_print(buf);
 
     char cmd_buf[128] = {};
