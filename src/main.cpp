@@ -32,7 +32,9 @@ void init_uart() {
         .data_bits = UART_DATA_8_BITS,
         .parity    = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_DEFAULT
     };
     uart_driver_install(UART_NUM_0, 1024, 0, 0, NULL, 0);
     uart_param_config(UART_NUM_0, &uart_config);
@@ -78,8 +80,8 @@ static inline void log_uart(const char *msg) {
 #define PWM_LEDC_CHANNEL LEDC_CHANNEL_0
 #define PWM_LEDC_SPEED_MODE LEDC_LOW_SPEED_MODE
 #define PWM_FREQ_HZ 44100
-#define PWM_DUTY_RES LEDC_TIMER_10_BIT
-#define PWM_DUTY_PERCENT 3  // adjust duty cycle here (0-100)
+#define PWM_DUTY_RES LEDC_TIMER_9_BIT
+#define PWM_DUTY_PERCENT 10  // adjust duty cycle here (0-100)
 
 static void init_pwm_44k1(void) {
     ledc_timer_config_t ledc_timer = {};
@@ -89,6 +91,13 @@ static void init_pwm_44k1(void) {
     ledc_timer.freq_hz = PWM_FREQ_HZ;
     ledc_timer.clk_cfg = LEDC_AUTO_CLK;
     ledc_timer_config(&ledc_timer);
+
+    {
+        uint32_t actual_freq = ledc_get_freq(PWM_LEDC_SPEED_MODE, PWM_LEDC_TIMER);
+        char buf[96];
+        snprintf(buf, sizeof(buf), "PWM actual frequency: %u Hz", (unsigned)actual_freq);
+        debug_print(buf);
+    }
 
     const uint32_t max_duty = (1U << PWM_DUTY_RES) - 1;
     const uint32_t duty = (max_duty * PWM_DUTY_PERCENT) / 100U;
@@ -107,6 +116,8 @@ static void init_pwm_44k1(void) {
 static volatile uint32_t channel_buffers[2][NUM_CHANNELS][BUFFER_LEN];
 static volatile uint32_t buffer_index = 0;
 static volatile uint8_t active_buffer = 0; // 0 or 1
+static volatile uint32_t capture_packets_sent = 0;
+static volatile uint32_t index_trigger_count = 0;
 
 // Control flag to pause ISR-driven sampling while test burst runs
 static volatile bool paused = true;
@@ -117,6 +128,7 @@ static volatile uint32_t button_press_count = 0;
 // Task handle for button handler (signalled from ISR)
 static TaskHandle_t buttonTaskHandle = nullptr;
 static TaskHandle_t burstTaskHandle = nullptr;
+static TaskHandle_t bufferMonitorTaskHandle = nullptr;
 
 static mcpwm_cap_timer_handle_t cap_timer = nullptr;
 static mcpwm_cap_timer_handle_t cap_timer_aux = nullptr;
@@ -169,17 +181,21 @@ static void IRAM_ATTR index_isr_handler(void* arg) {
     if (paused) {
         return; // don't advance buffer index while paused
     }
+    index_trigger_count = index_trigger_count + 1U;
     buffer_index = (buffer_index + 1) % BUFFER_LEN;
     if (buffer_index == 0) {
         // Swap buffers when a full set is collected
         active_buffer ^= 1;
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(bufferMonitorTaskHandle, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
     }
 }
 
 // ISR for button press: notify the button handling task (keep ISR short)
 static void IRAM_ATTR button_isr_handler(void* arg) {
     (void)arg;
-    button_press_count++;
+    button_press_count = button_press_count + 1U;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     vTaskNotifyGiveFromISR(buttonTaskHandle, &xHigherPriorityTaskWoken);
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
@@ -196,10 +212,10 @@ struct BurstRequest {
     int duration_ms;
 };
 
-static volatile BurstRequest burst_request = {kDefaultToneHz, kDefaultBurstMs};
+static BurstRequest burst_request = {kDefaultToneHz, kDefaultBurstMs};
 static volatile bool burst_active = false;
 static volatile bool burst_queued = false;
-static volatile BurstRequest burst_queued_request = {kDefaultToneHz, kDefaultBurstMs};
+static BurstRequest burst_queued_request = {kDefaultToneHz, kDefaultBurstMs};
 
 static uint32_t next_sine_sample(float &phase, float phase_inc) {
     float s = sinf(2.0f * 3.14159265f * phase);
@@ -360,7 +376,7 @@ static void init_mcpwm_capture(void) {
     mcpwm_capture_event_callbacks_t cbs = {};
     cbs.on_cap = cap_cb;
 
-    const uint32_t desired_cap_resolution_hz = 160000000;
+    const uint32_t desired_cap_resolution_hz = 89000000;
 
     mcpwm_capture_timer_config_t cap_timer_config = {};
     cap_timer_config.group_id = 0;
@@ -450,7 +466,7 @@ static void gpio_setup_task(void *pv) {
     io_conf.intr_type = GPIO_INTR_NEGEDGE;
 
     // install ISR service once at level 5
-    auto isr_res = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1 | ESP_INTR_FLAG_IRAM);
+    auto isr_res = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL2 | ESP_INTR_FLAG_IRAM);
     if (isr_res != ESP_OK) {
         char buf[128];
         snprintf(buf, sizeof(buf), "gpio_install_isr_service failed: %s", esp_err_to_name(isr_res));
@@ -461,6 +477,8 @@ static void gpio_setup_task(void *pv) {
 
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         io_conf.pin_bit_mask = (1ULL << channel_pins[i]);
+        io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+        io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
         gpio_config(&io_conf);
         {
             char buf[64];
@@ -529,7 +547,16 @@ static void send_buffers_over_usb(uint8_t send_buffer) {
     //     debug_print(buf);
     // }
 
-    usb_serial_jtag_write_bytes(tx_buf, payload_len, 20 / portTICK_PERIOD_MS);
+    size_t sent = 0;
+    while (sent < payload_len) {
+        int wrote = usb_serial_jtag_write_bytes(tx_buf + sent, payload_len - sent, 20 / portTICK_PERIOD_MS);
+        if (wrote > 0) {
+            sent += static_cast<size_t>(wrote);
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+    capture_packets_sent = capture_packets_sent + 1U;
 }
 
 static void buffer_monitor_task(void *pv) {
@@ -537,19 +564,34 @@ static void buffer_monitor_task(void *pv) {
 
     debug_print("Buffer monitor starting");
 
-    uint32_t last_index = 0;
+    const float payload_len = static_cast<float>(2 + NUM_CHANNELS * BUFFER_LEN * 3);
+    int64_t last_log_us = esp_timer_get_time();
     while (true) {
-        uint32_t idx = buffer_index;
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
         uint8_t send_buffer = active_buffer ^ 1;
-        // Detect wrap (index went from BUFFER_LEN-1 -> 0)
-        if (idx == 0 && last_index == BUFFER_LEN - 1) {
-            //char buf[64];
-            //snprintf(buf, sizeof(buf), "Buffer wrap detected - sending buffer %d", send_buffer);
-            //debug_print(buf);
-            send_buffers_over_usb(send_buffer);
+        send_buffers_over_usb(send_buffer);
+        int64_t now_us = esp_timer_get_time();
+        if ((now_us - last_log_us) >= 3000000) {
+            uint32_t packets = capture_packets_sent;
+            uint32_t index_triggers = index_trigger_count;
+            capture_packets_sent = 0;
+            index_trigger_count = 0;
+
+            const int64_t interval_us = now_us - last_log_us;
+            const float interval_sec = interval_us / 1000000.0f;
+            const float bytes_sent = packets * static_cast<float>(payload_len);
+            const float kbps = (interval_sec > 0.0f) ? (bytes_sent / 1024.0f / interval_sec) : 0.0f;
+            const float expected_indexes = (interval_sec > 0.0f) ? (interval_sec * 44100.0f) : 0.0f;
+            const float delta_indexes = static_cast<float>(index_triggers) - expected_indexes;
+
+            char buf[192];
+            snprintf(buf, sizeof(buf),
+                     "Capture packets: %u, index triggers: %u, rate: %.2f kB/s, interval: %.3f s, expected: %.1f, delta: %.1f",
+                     (unsigned)packets, (unsigned)index_triggers, kbps,
+                     interval_sec, expected_indexes, delta_indexes);
+            debug_print(buf);
+            last_log_us = now_us;
         }
-        last_index = idx;
-        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }
 
@@ -619,6 +661,7 @@ extern "C" void app_main(void) {
     debug_print(buf);
 
     BaseType_t r_bufmon = xTaskCreatePinnedToCore(buffer_monitor_task, "buffer_monitor_task", 4096, nullptr, 10, &h_bufmon, 1);
+    bufferMonitorTaskHandle = h_bufmon;
     debug_print("buffer_monitor_task create attempted");
     free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     snprintf(buf, sizeof(buf), "Free heap after buffer_monitor_task: %u bytes", (unsigned)free_heap);
