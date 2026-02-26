@@ -465,7 +465,7 @@ static void gpio_setup_task(void *pv) {
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     io_conf.intr_type = GPIO_INTR_NEGEDGE;
 
-    // install ISR service once at level 5
+    // install ISR service once at level 2
     auto isr_res = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL2 | ESP_INTR_FLAG_IRAM);
     if (isr_res != ESP_OK) {
         char buf[128];
@@ -477,7 +477,7 @@ static void gpio_setup_task(void *pv) {
 
     for (int i = 0; i < NUM_CHANNELS; ++i) {
         io_conf.pin_bit_mask = (1ULL << channel_pins[i]);
-        io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+        io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
         io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
         gpio_config(&io_conf);
         {
@@ -534,12 +534,37 @@ static void send_buffers_over_usb(uint8_t send_buffer) {
     size_t off = 2;
     for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
         for (int i = 0; i < BUFFER_LEN; ++i) {
-            uint32_t sample = channel_buffers[send_buffer][ch][i];
+
+            if (channel_buffers[send_buffer][ch][i] == 0) {
+                // No capture for this slot, backfiil with next capture value or previous capture val if at buffer edges
+                //otherwise fill with average of previous and next capture to correct for missed captures (can happen if capture happens during USB send or just due to timing)
+                if (i == 0) {
+                    // If at start of buffer, use next value if available
+                    channel_buffers[send_buffer][ch][i] = channel_buffers[send_buffer][ch][i + 1];                    
+                } else if (i == BUFFER_LEN - 1) {
+                    // If at end of buffer, use previous value if available
+                    channel_buffers[send_buffer][ch][i] = channel_buffers[send_buffer][ch][i - 1];                    
+                } else {
+                    // Otherwise, average previous and next values
+                    uint32_t prev_val = channel_buffers[send_buffer][ch][i - 1];
+                    uint32_t next_val = channel_buffers[send_buffer][ch][i + 1];
+                    channel_buffers[send_buffer][ch][i] = ((prev_val + next_val) / 2);                    
+                }
+            }
+
+            uint32_t sample = channel_buffers[send_buffer][ch][i];            
             tx_buf[off++] = (sample >> 0) & 0xFF;
             tx_buf[off++] = (sample >> 8) & 0xFF;
             tx_buf[off++] = (sample >> 16) & 0xFF;
-        }
+        }              
     }
+
+    // Clear the buffer after sending to mark as "no capture" for next round
+    for (int ch = 0; ch < NUM_CHANNELS; ++ch) {
+        for (int i = 0; i < BUFFER_LEN; ++i) {
+            channel_buffers[send_buffer][ch][i] = 0; // clear after reading, now 0s mean "no capture" for easier analysis
+        }
+    }  
 
     // {
     //     char buf[64];
