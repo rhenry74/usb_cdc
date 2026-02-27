@@ -192,9 +192,15 @@ static void IRAM_ATTR index_isr_handler(void* arg) {
     }
 }
 
+// Flag to enable button interrupts (delayed to avoid spurious triggers on boot)
+static volatile bool button_interrupt_enabled = false;
+
 // ISR for button press: notify the button handling task (keep ISR short)
 static void IRAM_ATTR button_isr_handler(void* arg) {
     (void)arg;
+    if (!button_interrupt_enabled) {
+        return; // Ignore interrupts before system is ready
+    }
     button_press_count = button_press_count + 1U;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     vTaskNotifyGiveFromISR(buttonTaskHandle, &xHigherPriorityTaskWoken);
@@ -247,6 +253,10 @@ static void send_test_burst(float tone_hz, int duration_ms) {
     uint32_t sample_index = 0;
     float phase = 0.0f;
 
+    // Timeout for USB writes (5 seconds total per packet)
+    constexpr int64_t kBurstTimeoutUs = 5000000;
+    bool burst_timed_out = false;
+
     for (uint32_t pkt = 0; pkt < packets; ++pkt) {
         tx_buf[0] = 0x55;
         tx_buf[1] = 0xAA;
@@ -267,23 +277,42 @@ static void send_test_burst(float tone_hz, int duration_ms) {
 
         int sent = 0;
         const int payload_len = sizeof(tx_buf);
+        int64_t packet_start_us = esp_timer_get_time();
+        
         while (sent < payload_len) {
+            int64_t elapsed_us = esp_timer_get_time() - packet_start_us;
+            if (elapsed_us > kBurstTimeoutUs) {
+                debug_print("Burst timed out - USB not connected or too slow");
+                burst_timed_out = true;
+                break;
+            }
+            
             int wrote = usb_serial_jtag_write_bytes(tx_buf + sent, payload_len - sent, 20 / portTICK_PERIOD_MS);
             if (wrote > 0) {
                 sent += wrote;
                 staged_amount += wrote;
             } else {
-                debug_print("wrote = 0, delaying before retry");
                 vTaskDelay(pdMS_TO_TICKS(1));
             }
         }
+        
+        if (burst_timed_out) {
+            break;
+        }
     }
 
-    debug_print("Sine burst complete, total bytes sent:");
-    {
+    if (burst_timed_out) {
+        debug_print("Burst aborted due to timeout");
         char buf[64];
-        snprintf(buf, sizeof(buf), "%d bytes sent in burst", staged_amount);
+        snprintf(buf, sizeof(buf), "%d bytes sent before timeout", staged_amount);
         debug_print(buf);
+    } else {
+        debug_print("Sine burst complete, total bytes sent:");
+        {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%d bytes sent in burst", staged_amount);
+            debug_print(buf);
+        }
     }
 }
 
@@ -500,6 +529,8 @@ static void gpio_setup_task(void *pv) {
     // Configure the user button pin (press to run test burst)
     io_conf.intr_type = GPIO_INTR_NEGEDGE; // button pulls pin low when pressed
     io_conf.pin_bit_mask = (1ULL << BUTTON_PIN);
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE; // Enable pull-up for button
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io_conf);
     gpio_isr_handler_add((gpio_num_t)BUTTON_PIN, button_isr_handler, nullptr);
     {
@@ -507,6 +538,12 @@ static void gpio_setup_task(void *pv) {
         snprintf(buf, sizeof(buf), "Button pin configured: %d", (int)BUTTON_PIN);
         debug_print(buf);
     }
+    
+    // Wait 2 seconds before enabling button interrupts to avoid spurious triggers on boot
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    button_interrupt_enabled = true;
+    debug_print("Button interrupts now enabled");
+    
     // restore intr type for other pins (if we need it later)
     io_conf.intr_type = GPIO_INTR_NEGEDGE;
 
@@ -523,6 +560,9 @@ static void gpio_setup_task(void *pv) {
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
+
+// Timeout for USB buffer sends (1 second)
+static constexpr int64_t kBufferSendTimeoutUs = 1000000;
 
 static void send_buffers_over_usb(uint8_t send_buffer) {
     // Pack sync + all channels into a single buffer and send once (better throughput)
@@ -573,7 +613,14 @@ static void send_buffers_over_usb(uint8_t send_buffer) {
     // }
 
     size_t sent = 0;
+    int64_t send_start_us = esp_timer_get_time();
     while (sent < payload_len) {
+        int64_t elapsed_us = esp_timer_get_time() - send_start_us;
+        if (elapsed_us > kBufferSendTimeoutUs) {
+            // Timeout - USB not connected or too slow, skip this buffer
+            return;
+        }
+        
         int wrote = usb_serial_jtag_write_bytes(tx_buf + sent, payload_len - sent, 20 / portTICK_PERIOD_MS);
         if (wrote > 0) {
             sent += static_cast<size_t>(wrote);
@@ -650,8 +697,8 @@ extern "C" void app_main(void) {
     // Disable task watchdog entirely for this project
     esp_task_wdt_deinit();
 
-    const char *msg = "USB Serial JTAG ready\r\n";
-    usb_serial_jtag_write_bytes(msg, strlen(msg), 2000 / portTICK_PERIOD_MS);
+    //const char *msg = "USB Serial JTAG ready\r\n";
+    //usb_serial_jtag_write_bytes(msg, strlen(msg), 2000 / portTICK_PERIOD_MS);
 
     debug_print("Creating tasks...");
 
