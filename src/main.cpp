@@ -71,7 +71,7 @@ static inline void log_uart(const char *msg) {
 // -------------------- High-speed GPIO sampling --------------------
 
 #define NUM_CHANNELS 4
-#define BUFFER_LEN 8
+#define BUFFER_LEN 16
 #define INDEX_PIN 17 // GPIO17
 #define BUTTON_PIN 0  // BOOT button; change if your board uses a different button/pin
 #define PWM_PIN 18   // GPIO18 (free pin for 44.1 kHz PWM output)
@@ -211,6 +211,11 @@ static constexpr uint32_t kSampleRateHz = 44100;
 static constexpr float kDefaultToneHz = 1000.0f;
 static constexpr int kDefaultBurstMs = 5000;
 
+// Maximum expected capture counts per sample interval (80MHz / 44.1kHz ≈ 1814)
+// Scale factor to fit into 16-bit: 65535 / 1814 ≈ 36
+static constexpr uint32_t kMaxCounts = 1814;
+static constexpr uint32_t kCaptureScale = 36;
+
 static portMUX_TYPE burst_request_mux = portMUX_INITIALIZER_UNLOCKED;
 
 struct BurstRequest {
@@ -226,12 +231,12 @@ static BurstRequest burst_queued_request = {kDefaultToneHz, kDefaultBurstMs};
 static uint32_t next_sine_sample(float &phase, float phase_inc) {
     float s = sinf(2.0f * 3.14159265f * phase);
     float scaled = 0.5f + 0.499999f * s; // keep within [0,1) to avoid clipping
-    uint32_t sample = static_cast<uint32_t>(scaled * 16777215.0f); // 24-bit unsigned
+    uint32_t sample = static_cast<uint32_t>(scaled * 65535.0f); // 16-bit unsigned
     phase += phase_inc;
     if (phase >= 1.0f) {
         phase -= 1.0f;
     }
-    return sample & 0xFFFFFF;
+    return sample & 0xFFFF;
 }
 
 static void send_test_burst(float tone_hz, int duration_ms) {
@@ -248,7 +253,7 @@ static void send_test_burst(float tone_hz, int duration_ms) {
     const uint32_t packets = (total_samples + samples_per_packet - 1) / samples_per_packet;
     const float phase_inc = tone_hz / static_cast<float>(kSampleRateHz);
 
-    static uint8_t tx_buf[2 + channels * samples_per_packet * 3];
+    static uint8_t tx_buf[2 + channels * samples_per_packet * 2];
     int staged_amount = 0;
     uint32_t sample_index = 0;
     float phase = 0.0f;
@@ -271,7 +276,6 @@ static void send_test_burst(float tone_hz, int duration_ms) {
                 }
                 tx_buf[off++] = (sample >> 0) & 0xFF;
                 tx_buf[off++] = (sample >> 8) & 0xFF;
-                tx_buf[off++] = (sample >> 16) & 0xFF;
             }
         }
 
@@ -568,8 +572,8 @@ static constexpr int64_t kBufferSendTimeoutUs = 1000000;
 
 static void send_buffers_over_usb(uint8_t send_buffer) {
     // Pack sync + all channels into a single buffer and send once (better throughput)
-    const size_t payload_len = 2 + (size_t)NUM_CHANNELS * BUFFER_LEN * 3;
-    static uint8_t tx_buf[2 + NUM_CHANNELS * BUFFER_LEN * 3];
+    const size_t payload_len = 2 + (size_t)NUM_CHANNELS * BUFFER_LEN * 2;
+    static uint8_t tx_buf[2 + NUM_CHANNELS * BUFFER_LEN * 2];
     tx_buf[0] = 0x55;
     tx_buf[1] = 0xAA;
 
@@ -594,10 +598,9 @@ static void send_buffers_over_usb(uint8_t send_buffer) {
                 }
             }
 
-            uint32_t sample = channel_buffers[send_buffer][ch][i];            
+            uint32_t sample = channel_buffers[send_buffer][ch][i] * kCaptureScale;            
             tx_buf[off++] = (sample >> 0) & 0xFF;
             tx_buf[off++] = (sample >> 8) & 0xFF;
-            tx_buf[off++] = (sample >> 16) & 0xFF;
         }              
     }
 
@@ -638,7 +641,7 @@ static void buffer_monitor_task(void *pv) {
 
     debug_print("Buffer monitor starting");
 
-    const float payload_len = static_cast<float>(2 + NUM_CHANNELS * BUFFER_LEN * 3);
+    const float payload_len = static_cast<float>(2 + NUM_CHANNELS * BUFFER_LEN * 2);
     int64_t last_log_us = esp_timer_get_time();
     while (true) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
