@@ -367,6 +367,8 @@ static void burst_task(void* pv) {
         }
         burst_active = false;
         taskEXIT_CRITICAL(&burst_request_mux);
+        //yield to other tasks before resuming sampling
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -482,7 +484,7 @@ static void init_mcpwm_capture(void) {
     }
 }
 
-// Task to configure GPIO interrupts (core 1)
+// Task to configure GPIO interrupts (Core 0 - ISR handling)
 static void gpio_setup_task(void *pv) {
     (void) pv;
     debug_print("gpio_setup_task started");
@@ -713,19 +715,19 @@ extern "C" void app_main(void) {
     snprintf(buf, sizeof(buf), "Free heap before tasks: %u bytes", (unsigned)free_heap);
     debug_print(buf);
 
-    BaseType_t r_burst = xTaskCreatePinnedToCore(burst_task, "burst_task", 4096, nullptr, 11, &burstTaskHandle, 1);
+    BaseType_t r_burst = xTaskCreatePinnedToCore(burst_task, "burst_task", 4096, nullptr, 11, &burstTaskHandle, 0);
     debug_print("burst_task create attempted");
     free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     snprintf(buf, sizeof(buf), "Free heap after burst_task: %u bytes", (unsigned)free_heap);
     debug_print(buf);
 
-    BaseType_t r_button = xTaskCreatePinnedToCore(button_task, "button_task", 2048, nullptr, 10, &buttonTaskHandle, 1);
+    BaseType_t r_button = xTaskCreatePinnedToCore(button_task, "button_task", 2048, nullptr, 10, &buttonTaskHandle, 0);
     debug_print("button_task create attempted");
     free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     snprintf(buf, sizeof(buf), "Free heap after button_task: %u bytes", (unsigned)free_heap);
     debug_print(buf);
 
-    BaseType_t r_gpio = xTaskCreatePinnedToCore(gpio_setup_task, "gpio_setup_task", 4096, nullptr, 10, &h_gpio, 1);
+    BaseType_t r_gpio = xTaskCreatePinnedToCore(gpio_setup_task, "gpio_setup_task", 4096, nullptr, 10, &h_gpio, 0);
     debug_print("gpio_setup_task create attempted");
     vTaskDelay(pdMS_TO_TICKS(1000));
     free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
