@@ -116,7 +116,7 @@ This project runs on the ESP32‑S3 and combines **USB Serial JTAG throughput te
 
 ### Architecture
 The system uses the ESP32-S3's **MCPWM Capture** peripheral for precise edge timing, replacing software ISR jitter with hardware latches.
-- **Capture Timers**: Two MCPWM capture timers (Group 0 & 1) run continuously at ~89 MHz.
+- **Capture Timers**: Two MCPWM capture timers (Group 0 & 1) run continuously at 80 MHz (APB clock).
 - **Synchronization**: The **INDEX_PIN** triggers a hardware sync that resets both timers to 0, ensuring all timestamps are relative to the ramp start.
 - **Capture Channels**: 6 comparator outputs are routed to MCPWM capture channels (3 on Group 0, 3 on Group 1). On a negative edge, the hardware latches the timer value into a register and triggers a lightweight callback (`cap_cb`) to store it in the buffer.
 
@@ -176,7 +176,7 @@ Inside `app_main()` (core 0):
 ---
 
 ## 6) PWM Output
-A constant PWM is produced on **GPIO18**:
+A constant PWM is produced on **GPIO18** (separate from the ADC capture — this is a utility/test output only):
 - **Frequency**: 44.1 kHz
 - **Duty**: 10% (configurable via `PWM_DUTY_PERCENT`)
 - **LEDC low‑speed mode**
@@ -184,7 +184,54 @@ A constant PWM is produced on **GPIO18**:
 
 ---
 
-## 7) Capture‑Miss Correction
+## 7) Capture Dynamic Range
+
+### Effective ADC Resolution
+
+The ADC resolution is determined by the **capture timer clock** relative to the **sample rate**:
+
+- **Capture timer clock**: 80 MHz (APB clock routed via MCPWM)
+- **Sample period**: 1 / 44.1 kHz ≈ **22.7 µs**
+- **Max counts per sample**: 80,000,000 / 44,100 ≈ **1814**
+
+```
+log₂(1814) ≈ 10.83 bits
+```
+
+This means the effective amplitude resolution is approximately **10.8 bits**. Each step corresponds to ≈ 1 / 1814 ≈ 0.055% of the ramp voltage range.
+
+The capture timer configuration requests 89 MHz in the driver, but the MCPWM capture clock source is tied to the APB bus (80 MHz on ESP32-S3), so the actual resolution is limited by the APB clock rate. The code reads back the actual timer resolution at runtime and logs it via UART for verification.
+
+This resolution is set by the hardware clock — to increase it you would need a higher capture clock rate or a lower sample rate.
+
+### Conversion to 16-bit USB Data
+
+The raw capture timestamps are 32-bit values. Before sending over USB they are **scaled linearly** to make efficient use of the 16-bit output word:
+
+```
+kMaxCounts  = 1814   (theoretical max at 80 MHz / 44.1 kHz)
+kCaptureScale = 36    = 65535 / 1814, rounded
+scaled_sample = raw_timestamp × kCaptureScale
+```
+
+- With a 16-bit word, the maximum value is **65535**.
+- The scale factor (×36) maps the expected ~1814-count range across the full 0–65535 span.
+- The result is sent as **2 bytes per sample** (little‑endian) over USB Serial JTAG.
+- No precision is lost — the 11-bit raw value is simply spread across a 16-bit container for host-side convenience.
+
+### Host-Side Reconstruction
+
+On the host PC, the original capture timer count can be recovered by:
+
+```
+raw_timestamp = usb_sample_16bit / 36
+```
+
+Or the value can be used directly as a 16-bit amplitude measurement (the common case).
+
+---
+
+## 8) Capture‑Miss Correction
 When a buffer slot contains zero (no capture event for that sample), the `send_buffers_over_usb()` function fills it with:
 - The **next** value if at the start of the buffer.
 - The **previous** value if at the end of the buffer.
@@ -224,7 +271,7 @@ With `NUM_CHANNELS=6` and `BUFFER_LEN=16`, each packet is **194 bytes**.
 ```
 External Comparators (6 ch)
         ↓  (falling edges on GPIO2,4,5,13,14,15)
-MCPWM Capture Hardware (Group 0 & 1 timers @ ~89 MHz)
+MCPWM Capture Hardware (Group 0 & 1 timers @ 80 MHz)
         ↓  (hardware-latched timestamps)
 cap_cb() → channel_buffers[active_buffer][ch][idx]
         ↓  (buffer wrap at 16 samples)
