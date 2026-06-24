@@ -70,7 +70,7 @@ static inline void log_uart(const char *msg) {
 
 // -------------------- High-speed GPIO sampling --------------------
 
-#define NUM_CHANNELS 4
+#define NUM_CHANNELS 6
 #define BUFFER_LEN 16
 #define INDEX_PIN 17 // GPIO17
 #define BUTTON_PIN 0  // BOOT button; change if your board uses a different button/pin
@@ -379,7 +379,7 @@ static void burst_task(void* pv) {
 // Pins to use for interrupts (change as needed)
 // NOTE: GPIO12 can be a strapping/boot pin on some devkits; use GPIO13 instead on ESP32-S3 DevKitC-1-N16R8
 static const gpio_num_t channel_pins[NUM_CHANNELS] = {
-    GPIO_NUM_2, GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_13
+    GPIO_NUM_2, GPIO_NUM_4, GPIO_NUM_5, GPIO_NUM_13, GPIO_NUM_14, GPIO_NUM_15
 };
 
 // Task that handles button press: pause sampling, send messages & test burst, resume
@@ -466,6 +466,24 @@ static void init_mcpwm_capture(void) {
     ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer_aux, &cap_ch_config, &cap_ch[3]));
     ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_ch[3], &cbs, (void*)(intptr_t)3));
     ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_ch[3]));
+
+    // Channel 4 on Group 1 (GPIO14)
+    cap_ch_config.gpio_num = channel_pins[4];
+    cap_ch_config.prescale = 1;
+    cap_ch_config.flags.neg_edge = true;
+    cap_ch_config.flags.pos_edge = false;
+    ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer_aux, &cap_ch_config, &cap_ch[4]));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_ch[4], &cbs, (void*)(intptr_t)4));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_ch[4]));
+
+    // Channel 5 on Group 1 (GPIO15)
+    cap_ch_config.gpio_num = channel_pins[5];
+    cap_ch_config.prescale = 1;
+    cap_ch_config.flags.neg_edge = true;
+    cap_ch_config.flags.pos_edge = false;
+    ESP_ERROR_CHECK(mcpwm_new_capture_channel(cap_timer_aux, &cap_ch_config, &cap_ch[5]));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_register_event_callbacks(cap_ch[5], &cbs, (void*)(intptr_t)5));
+    ESP_ERROR_CHECK(mcpwm_capture_channel_enable(cap_ch[5]));
 
     mcpwm_gpio_sync_src_config_t sync_src_aux_cfg = {};
     sync_src_aux_cfg.group_id = 1;
